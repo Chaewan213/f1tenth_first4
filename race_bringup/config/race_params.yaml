@@ -1,0 +1,123 @@
+# race_params.yaml
+# "확인필요" 표시 값은 실차에서 측정·확인 후 바꿀 것 (목록: docs/TODO_VALUES.md)
+# 주의: ROS2 파라미터는 타입이 고정이다. 실수 파라미터는 반드시 소수점(예: 1.0)으로 쓴다.
+
+gap_planner:
+  ros__parameters:
+    scan_topic: /scan
+    # --- 기반 코드(reactive_node.py)와 동일한 값 ---
+    field_of_view_deg: 180.0
+    max_range: 10.0
+    smoothing_window: 5
+    bubble_radius: 0.45
+    front_half_angle_deg: 5.0
+    straight_speed: 1.5
+    corner_speed: 1.0
+    sharp_corner_speed: 0.5
+    front_slowdown_distance: 2.5
+    front_stop_distance: 0.7
+    corner_angle_deg: 10.0
+    sharp_corner_angle_deg: 20.0
+    # --- 새로 추가된 값 ---
+    side_window_min_deg: 60.0
+    side_window_max_deg: 90.0
+    corridor_side_max: 1.5       # 확인필요: 파이프 통로 폭의 절반보다 약간 크게
+    path_step: 0.25
+    path_max_len: 2.0
+    path_min_len: 0.5
+    heading_filter_alpha: 0.7    # 1.0 = 필터 없음(기반 코드와 동일)
+
+lane_planner:
+  ros__parameters:
+    backend: classic             # classic | onnx
+    image_topic: /flir_camera/image_raw   # 수업 기준 (FLIR Blackfly S, spinnaker 드라이버)
+    input_is_bev: false          # 시뮬처럼 BEV 이미지가 바로 들어오면 true
+    speed_limit: 1.5
+    publish_debug_image: false
+    bev_width: 400
+    bev_height: 400
+    m_per_px: 0.005              # 확인필요
+    origin_u: 200.0              # 확인필요
+    origin_v: 440.0              # 확인필요
+    hsv_low: [18, 50, 120]       # 수업 기준값 (노란 테이프). 조명에 따라 조정
+    hsv_high: [36, 255, 255]     # 수업 기준값
+    n_windows: 10
+    window_margin: 40
+    min_pixels: 30
+    lane_width_m: 0.80           # 수업 예시 실측값. 확인필요: 우리 트랙 차선 폭 실측
+    path_step_m: 0.1
+    path_max_m: 1.5
+    path_min_m: 0.2
+    single_side_penalty: 0.7
+    # 확인필요: calibrate_homography 출력값으로 교체 (전부 0이면 차선 계획을 내지 않음)
+    homography: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # 렌즈 왜곡 보정: 수업 ost.yaml의 camera_matrix(9개), distortion_coefficients(5개)를 그대로 옮김
+    # 확인필요: 우리 카메라의 ost.yaml 값. 전부 0이면 보정 안 함
+    camera_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+    # --- backend: onnx 일 때만 사용 (수업 학습 코드와 일치시킬 것) ---
+    model_path: ""               # 확인필요
+    model_input_width: 224       # 확인필요
+    model_input_height: 224      # 확인필요
+    model_mean: [0.485, 0.456, 0.406]   # 확인필요
+    model_std: [0.229, 0.224, 0.225]    # 확인필요
+    model_rgb: true              # 확인필요
+    model_y_sign: 1.0            # 수업 라벨은 Y 좌측(+) -> 1.0
+    # 수업 라벨 원점(카메라 바로 아래 지면)이 뒷바퀴 축보다 앞에 있는 거리 [m]
+    model_origin_offset_x: 0.0   # 확인필요: 뒷바퀴 축 중심 ~ 카메라 렌즈 바로 아래 바닥점 거리 실측
+
+mode_manager:
+  ros__parameters:
+    rate_hz: 50.0
+    initial_mode: LANE
+    force_mode: AUTO             # AUTO = 자동 전환 / 테스트용: GAP 또는 LANE 고정
+    lane_conf_high: 0.6
+    lane_conf_low: 0.3
+    gap_conf_high: 0.75
+    gap_conf_low: 0.25
+    confirm_frames: 5
+    plan_timeout: 0.3
+    transition_hold_time: 0.5
+    transition_speed_limit: 0.8
+
+tracker:
+  ros__parameters:
+    algorithm: pure_pursuit
+    odom_topic: /odom
+    rate_hz: 50.0
+    wheelbase: 0.33              # 확인필요: 실차 앞뒤 축간 거리 실측 [m]
+    max_steering_angle: 0.4189   # 기반 코드 24도. 확인필요: 실차 기계 한계
+    max_steering_rate: 3.0       # [rad/s]
+    a_lat_max: 3.0               # 확인필요: 미끄러지지 않는 횡가속 [m/s^2]
+    a_brake: 3.0                 # 확인필요: 제동 감속도 [m/s^2]
+    max_accel: 2.0
+    stop_margin: 0.3
+    plan_timeout: 0.3
+    lane:
+      lookahead_k: 0.3
+      lookahead_l0: 0.6
+      lookahead_min: 0.6
+      lookahead_max: 2.0
+      v_max: 2.0
+    gap:
+      lookahead_k: 0.2
+      lookahead_l0: 0.4
+      lookahead_min: 0.4
+      lookahead_max: 1.5
+      v_max: 1.5
+
+safety_filter:
+  ros__parameters:
+    scan_topic: /scan
+    odom_topic: /odom
+    enable_aeb: true
+    ttc_threshold: 0.4           # 확인필요: 실차 제동 테스트로 조정 [s]
+    vehicle_half_width: 0.15     # 확인필요: 차폭의 절반 [m]
+    lateral_margin: 0.05
+    max_check_range: 5.0
+    release_time: 0.5
+    max_speed: 3.0
+    max_steering_angle: 0.4189   # tracker와 같은 값
+    drive_timeout: 0.2
+    scan_timeout: 0.2
+    odom_timeout: 0.2

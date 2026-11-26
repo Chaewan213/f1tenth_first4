@@ -1,0 +1,431 @@
+From 6f9e4cde9a8742d19624d29c95ba12ab8e590926 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 21:02:48 +0900
+Subject: [PATCH] =?UTF-8?q?fix(lane=5Fplanner):=20=EC=88=98=EC=97=85=20?=
+ =?UTF-8?q?=EA=B8=B0=EC=A4=80=EA=B0=92=20=EB=B0=98=EC=98=81=20(FLIR=20?=
+ =?UTF-8?q?=ED=86=A0=ED=94=BD,=20Bayer,=20HSV,=20=EC=B0=A8=EC=84=A0?=
+ =?UTF-8?q?=ED=8F=AD,=207=EC=A0=90=20waypoint)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- image_topic 기본값 /flir_camera/image_raw
+- bayer_rggb8 -> COLOR_BayerBG2BGR 직접 변환 (색 뒤바뀜 방지)
+- 렌즈 왜곡 보정 파라미터(camera_matrix, dist_coeffs) 추가, 기본은 미사용
+- HSV (18,50,120)~(36,255,255), lane_width_m 0.80
+- 학습 모델 출력 N점(수업 7점) 모두 경로로 사용, model_origin_offset_x 보정 추가
+- 문서: 토픽, 확인필요 값, 카메라 절차, Jetson Orin Nano 반영
+- 테스트 5개 추가 (전체 core 테스트 통과)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ZA2FmFEcNqBfVteGoXrXp
+---
+ README.md                                     |  2 +-
+ docs/TODO_VALUES.md                           | 10 ++--
+ docs/camera_pipeline.md                       |  8 +--
+ docs/interfaces.md                            |  2 +-
+ lane_planner/lane_planner/lane_core.py        | 52 ++++++++++++++++---
+ .../lane_planner/lane_planner_node.py         | 32 ++++++++++--
+ lane_planner/lane_planner/waypoint_model.py   | 18 +++++--
+ lane_planner/test/test_lane_core.py           | 51 +++++++++++++++++-
+ race_bringup/config/race_params.yaml          | 16 ++++--
+ 9 files changed, 161 insertions(+), 30 deletions(-)
+
+diff --git a/README.md b/README.md
+index c577815..5dd694b 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # f1tenth_first4
+ 
+-F1TENTH 레이스 주행 스택 (ROS 2 Humble). 코스: 1/4 카메라 차선 구간 + 3/4 라이다 파이프 통로·장애물 구간, 3바퀴.
++F1TENTH 레이스 주행 스택 (ROS 2 Humble, Jetson Orin Nano). 코스: 1/4 카메라 차선 구간 + 3/4 라이다 파이프 통로·장애물 구간, 3바퀴.
+ 
+ ## 구조
+ 
+diff --git a/docs/TODO_VALUES.md b/docs/TODO_VALUES.md
+index 3e8c435..4bc5a5e 100644
+--- a/docs/TODO_VALUES.md
++++ b/docs/TODO_VALUES.md
+@@ -17,7 +17,7 @@
+ 
+ | 항목 | 현재 값 | 확인 방법 |
+ |---|---|---|
+-| 카메라 이미지 토픽 `image_topic` | /camera/image_raw | `ros2 topic list`로 실제 드라이버 토픽 확인 |
++| 카메라 이미지 토픽 `image_topic` | /flir_camera/image_raw (수업 기준) | `ros2 topic list`로 확인 |
+ | 오도메트리 토픽 `odom_topic` | /odom | 실차 VESC 토픽 확인. 시뮬은 /ego_racecar/odom |
+ | 라이다 토픽 `scan_topic` | /scan | 실차 라이다 드라이버 확인 |
+ 
+@@ -27,8 +27,9 @@
+ |---|---|---|
+ | `homography` (9개) | 전부 0 (미설정) | `calibrate_homography` 실행 결과 붙여 넣기 |
+ | `m_per_px`, `origin_u`, `origin_v` | 0.005, 200.0, 440.0 | BEV 해상도와 차량 원점 위치 결정 (캘리브레이션과 같은 값 사용) |
+-| `hsv_low`, `hsv_high` | 노란색 범위 | 실제 차선 테이프 색으로 조정 (`publish_debug_image: true`로 확인) |
+-| `lane_width_m` | 0.6 | 코스 차선 폭 실측 |
++| `camera_matrix`, `dist_coeffs` | 전부 0 (보정 안 함) | 우리 카메라의 `ost.yaml` 값을 옮김 |
++| `hsv_low`, `hsv_high` | (18,50,120)~(36,255,255) 수업 기준값 | 조명에 맞춰 조정 (`publish_debug_image: true`로 확인) |
++| `lane_width_m` | 0.80 (수업 예시) | 우리 트랙 차선 폭 실측 (두 테이프 중심 간격) |
+ 
+ ## 4. 학습 모델 (backend: onnx 사용 시)
+ 
+@@ -37,7 +38,8 @@
+ | `model_path` | Jetson에 복사한 .onnx 경로 |
+ | `model_input_width/height` | 학습 코드의 입력 크기 |
+ | `model_mean/std`, `model_rgb` | 학습 코드의 정규화와 색 순서 |
+-| `model_y_sign` | 학습 라벨 wp_y가 좌측(+)이면 1.0, 우측(+)이면 -1.0 |
++| `model_y_sign` | 수업 라벨은 Y 좌측(+) → 1.0 |
++| `model_origin_offset_x` | 뒷바퀴 축 중심에서 카메라 렌즈 바로 아래 바닥점까지 앞쪽 거리 [m] 실측 |
+ 
+ ## 5. 코스 (트랙에서 조정)
+ 
+diff --git a/docs/camera_pipeline.md b/docs/camera_pipeline.md
+index 78b5060..be5f87f 100644
+--- a/docs/camera_pipeline.md
++++ b/docs/camera_pipeline.md
+@@ -12,6 +12,7 @@
+ ## 1. 캘리브레이션 (실차, 1회)
+ 
+ 1. 카메라를 최종 위치에 고정합니다. 이후 마운트를 건드리면 다시 해야 합니다.
++   렌즈 왜곡 보정값(수업 `ost.yaml`의 camera_matrix, distortion_coefficients)을 `race_params.yaml`의 `camera_matrix`, `dist_coeffs`에 먼저 넣습니다. 호모그래피는 왜곡 보정된 영상 기준으로 구해야 합니다.
+ 2. 차 앞 바닥에 직사각형 꼭짓점 4개를 테이프로 표시하고, 각 점의 차량 기준 좌표(x 전방, y 좌측, m)를 잽니다. 원점은 뒷바퀴 축 중심입니다.
+ 3. 카메라 이미지 한 장을 저장해 4개 점의 픽셀 좌표(u, v)를 읽습니다.
+ 4. BEV 해상도를 정합니다: `m_per_px`(예: 0.005 = 1픽셀 5mm), `origin_u`, `origin_v`.
+@@ -41,7 +42,7 @@ ros2 run lane_planner calibrate_homography \
+ 
+ 시뮬레이션 BEV와 실차 BEV(카메라 → IPM)는 질감·조명·왜곡이 다릅니다. 실차 성능이 부족하면 실차 데이터를 추가합니다.
+ 
+-1. 차선 구간을 천천히 수동 주행하며 rosbag을 기록합니다: `ros2 bag record /camera/image_raw /odom`
++1. 차선 구간을 천천히 수동 주행하며 rosbag을 기록합니다: `ros2 bag record /flir_camera/image_raw /flir_camera/camera_info /odom`
+ 2. 각 프레임을 BEV로 바꿔 PNG로 저장합니다 (lane_core.warp_to_bev 사용).
+ 3. 라벨 만들기 (둘 중 하나):
+    - classic 백엔드의 중심선에서 lookahead 거리 지점을 자동 라벨로 쓰고, 틀린 프레임만 사람이 고칩니다.
+@@ -49,11 +50,12 @@ ros2 run lane_planner calibrate_homography \
+ 4. 수업과 같은 표 형식(`file, wp_x, wp_y`)으로 만들고, 비슷한 연속 프레임이 train과 test에 섞이지 않게 주행 구간 단위로 나눕니다.
+ 5. 시뮬 사전학습 모델에서 이어서 학습합니다(fine-tuning). 밝기·색 변화 augmentation을 켭니다.
+ 
+-## 4. 배포 (Jetson)
++## 4. 배포 (Jetson Orin Nano)
+ 
+ 1. PyTorch → ONNX 내보내기 (수업 `export_resnet18_onnx.py`와 같은 방식, dummy input 크기 = 학습 입력 크기).
+ 2. Jetson에 .onnx 복사 후 `race_params.yaml` 설정:
+-   - `backend: onnx`, `model_path`, `model_input_width/height`, `model_mean/std`, `model_rgb`, `model_y_sign`
++   - `backend: onnx`, `model_path`, `model_input_width/height`, `model_mean/std`, `model_rgb`, `model_y_sign`, `model_origin_offset_x`
++   - 모델이 waypoint 7점을 출력하면 lane_planner가 7점을 모두 경로로 냅니다 (출력 길이에 맞춰 자동 처리)
+ 3. 먼저 ONNX Runtime으로 동작을 확인하고, 속도가 부족하면 TensorRT FP16 엔진으로 바꿉니다 (수업 `trtexec --fp16`).
+ 4. 같은 rosbag을 classic과 onnx 백엔드로 각각 재생해 `/plan/lane` 결과를 비교한 뒤 실차에 올립니다.
+ 
+diff --git a/docs/interfaces.md b/docs/interfaces.md
+index d367b29..b9ec7be 100644
+--- a/docs/interfaces.md
++++ b/docs/interfaces.md
+@@ -22,7 +22,7 @@
+ 
+ | 토픽 | 타입 | 발행 | 구독 |
+ |---|---|---|---|
+-| `/camera/image_raw` | sensor_msgs/Image | 카메라 드라이버 | lane_planner |
++| `/flir_camera/image_raw` | sensor_msgs/Image (bayer_rggb8) | 카메라 드라이버 (spinnaker) | lane_planner |
+ | `/scan` | sensor_msgs/LaserScan | 라이다 드라이버 | gap_planner, safety_filter |
+ | `/odom` | nav_msgs/Odometry | VESC | tracker, safety_filter |
+ | `/plan/lane` | race_msgs/LocalPlan | lane_planner | mode_manager |
+diff --git a/lane_planner/lane_planner/lane_core.py b/lane_planner/lane_planner/lane_core.py
+index 37a367d..3790636 100644
+--- a/lane_planner/lane_planner/lane_core.py
++++ b/lane_planner/lane_planner/lane_core.py
+@@ -19,17 +19,47 @@ class LaneParams:
+     m_per_px: float = 0.005              # BEV 1픽셀 = 몇 m (확인필요)
+     origin_u: float = 200.0              # 차량 원점의 BEV 열 [px] (확인필요)
+     origin_v: float = 440.0              # 차량 원점의 BEV 행 [px], 이미지 아래 밖일 수 있음 (확인필요)
+-    hsv_low: Tuple[int, int, int] = (15, 80, 80)    # 차선 색 하한 (확인필요: 실제 테이프 색)
+-    hsv_high: Tuple[int, int, int] = (40, 255, 255)  # 차선 색 상한 (확인필요)
++    hsv_low: Tuple[int, int, int] = (18, 50, 120)    # 차선 색 하한 (수업 IRCV 3주차 기준값)
++    hsv_high: Tuple[int, int, int] = (36, 255, 255)  # 차선 색 상한 (수업 기준값)
+     n_windows: int = 10
+     window_margin: int = 40              # 슬라이딩 윈도우 반폭 [px]
+     min_pixels: int = 30                 # 윈도우 재중심 최소 픽셀 수
+-    lane_width_m: float = 0.6            # 차선 폭 [m] (확인필요)
++    lane_width_m: float = 0.80           # 차선 폭 [m] (수업 예시 실측값, 우리 트랙 확인필요)
+     path_step_m: float = 0.1
+     path_max_m: float = 1.5
+     path_min_m: float = 0.2
+     single_side_penalty: float = 0.7     # 한쪽 차선만 보일 때 신뢰도 배율
+     homography: List[float] = field(default_factory=lambda: [0.0] * 9)
++    # 렌즈 왜곡 보정 (수업 ost.yaml의 camera_matrix, distortion_coefficients). 전부 0이면 보정 안 함
++    camera_matrix: List[float] = field(default_factory=lambda: [0.0] * 9)
++    dist_coeffs: List[float] = field(default_factory=lambda: [0.0] * 5)
++
++
++# ROS Bayer 인코딩 -> OpenCV 변환 코드.
++# OpenCV는 패턴의 2번째 행 기준으로 이름을 붙이므로 bayer_rggb8 -> COLOR_BayerBG2BGR (수업 IRCV 3주차).
++# 잘못 고르면 R/B가 바뀌어 노란 차선이 하늘색으로 보인다.
++BAYER_TO_BGR = {
++    'bayer_rggb8': cv2.COLOR_BayerBG2BGR,
++    'bayer_bggr8': cv2.COLOR_BayerRG2BGR,
++    'bayer_gbrg8': cv2.COLOR_BayerGR2BGR,
++    'bayer_grbg8': cv2.COLOR_BayerGB2BGR,
++}
++
++
++def bayer_to_bgr(raw: np.ndarray, encoding: str) -> np.ndarray:
++    code = BAYER_TO_BGR.get(encoding)
++    if code is None:
++        raise ValueError(f'지원하지 않는 Bayer 인코딩: {encoding}')
++    return cv2.cvtColor(raw, code)
++
++
++def undistort_maps(p: 'LaneParams', width: int, height: int):
++    """왜곡 보정 remap 테이블. camera_matrix가 비어 있으면 None (보정 생략)."""
++    if not any(abs(v) > 1e-12 for v in p.camera_matrix):
++        return None
++    K = np.asarray(p.camera_matrix, np.float64).reshape(3, 3)
++    D = np.asarray(p.dist_coeffs, np.float64).reshape(-1)
++    return cv2.initUndistortRectifyMap(K, D, None, K, (width, height), cv2.CV_16SC2)
+ 
+ 
+ def homography_valid(h: List[float]) -> bool:
+@@ -140,8 +170,16 @@ def lane_visibility(bev_bgr: np.ndarray, p: LaneParams) -> float:
+     return float(np.clip(max(lr, rr) if min(lr, rr) == 0 else 0.5 * (lr + rr), 0.0, 1.0))
+ 
+ 
+-def waypoint_plan(wp_xy: Optional[Tuple[float, float]], conf: float):
+-    """학습 모델의 waypoint 1개를 경로로. tracker는 점이 1개면 그 점을 그대로 추종한다."""
+-    if wp_xy is None:
++def waypoint_plan(wps: Optional[List[Tuple[float, float]]], conf: float,
++                  origin_offset_x: float = 0.0):
++    """학습 모델의 waypoint(1개 또는 수업 라벨처럼 7개)를 경로로 바꾼다.
++
++    origin_offset_x: 모델 라벨 원점(수업: 카메라 바로 아래 지면)이 뒷바퀴 축(base_link)보다
++    앞에 있는 거리 [m]. 이 값을 x에 더해 base_link 기준으로 맞춘다.
++    점은 차량에서 가까운 순으로 정렬한다. 점이 1개면 tracker는 그 점을 그대로 추종한다.
++    """
++    if not wps:
+         return [], 0.0
+-    return [(float(wp_xy[0]), float(wp_xy[1]))], conf
++    pts = [(float(x) + origin_offset_x, float(y)) for x, y in wps]
++    pts.sort(key=lambda q: q[0] * q[0] + q[1] * q[1])
++    return pts, conf
+diff --git a/lane_planner/lane_planner/lane_planner_node.py b/lane_planner/lane_planner/lane_planner_node.py
+index e0d719a..8f81161 100644
+--- a/lane_planner/lane_planner/lane_planner_node.py
++++ b/lane_planner/lane_planner/lane_planner_node.py
+@@ -2,7 +2,7 @@
+ 
+ 백엔드
+ - classic: HSV 임계값 + 슬라이딩 윈도우로 중심선을 만든다 (모델 없이 바로 동작)
+-- onnx:    수업에서 학습한 waypoint 회귀 모델로 점 1개를 만든다
++- onnx:    수업에서 학습한 waypoint 회귀 모델로 점 1개 또는 7개를 만든다
+ 이 노드는 /drive를 직접 발행하지 않는다.
+ """
+ import cv2
+@@ -28,7 +28,7 @@ class LanePlannerNode(Node):
+         self.input_is_bev = g('input_is_bev', False).value
+         self.speed_limit = g('speed_limit', 1.5).value
+         self.publish_debug = g('publish_debug_image', False).value
+-        image_topic = g('image_topic', '/camera/image_raw').value
++        image_topic = g('image_topic', '/flir_camera/image_raw').value
+ 
+         self.p = LaneParams(
+             bev_width=g('bev_width', d.bev_width).value,
+@@ -47,7 +47,12 @@ class LanePlannerNode(Node):
+             path_min_m=g('path_min_m', d.path_min_m).value,
+             single_side_penalty=g('single_side_penalty', d.single_side_penalty).value,
+             homography=list(g('homography', [0.0] * 9).value),
++            camera_matrix=list(g('camera_matrix', [0.0] * 9).value),
++            dist_coeffs=list(g('dist_coeffs', [0.0] * 5).value),
+         )
++        self.model_origin_offset_x = g('model_origin_offset_x', 0.0).value
++        self._maps = None
++        self._maps_size = None
+ 
+         self.model = None
+         if self.backend == 'onnx':
+@@ -89,14 +94,17 @@ class LanePlannerNode(Node):
+             self.pub.publish(plan)
+             return
+ 
+-        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
++        img = self.to_bgr(msg)
++        if not self.input_is_bev:
++            img = self.undistort(img)
+         bev = img if self.input_is_bev else lane_core.warp_to_bev(img, self.p)
+         if self.input_is_bev and bev.shape[:2] != (self.p.bev_height, self.p.bev_width):
+             bev = cv2.resize(bev, (self.p.bev_width, self.p.bev_height))
+ 
+         if self.backend == 'onnx':
+             conf = lane_core.lane_visibility(bev, self.p)
+-            pts, conf = lane_core.waypoint_plan(self.model.predict(bev), conf)
++            pts, conf = lane_core.waypoint_plan(
++                self.model.predict(bev), conf, self.model_origin_offset_x)
+         else:
+             pts, conf = lane_core.classic_plan(bev, self.p)
+ 
+@@ -108,6 +116,22 @@ class LanePlannerNode(Node):
+         if self.pub_dbg is not None:
+             self.pub_dbg.publish(self.bridge.cv2_to_imgmsg(self.draw_debug(bev, pts), 'bgr8'))
+ 
++    def to_bgr(self, msg: Image):
++        # FLIR Blackfly S는 bayer_rggb8로 보낸다. 변환 코드를 직접 지정해 색이 뒤바뀌지 않게 한다.
++        if msg.encoding.startswith('bayer_'):
++            raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
++            return lane_core.bayer_to_bgr(raw, msg.encoding)
++        return self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
++
++    def undistort(self, img):
++        h, w = img.shape[:2]
++        if self._maps_size != (w, h):
++            self._maps = lane_core.undistort_maps(self.p, w, h)
++            self._maps_size = (w, h)
++        if self._maps is None:
++            return img
++        return cv2.remap(img, self._maps[0], self._maps[1], cv2.INTER_LINEAR)
++
+     def draw_debug(self, bev, pts):
+         out = bev.copy()
+         for x, y in pts:
+diff --git a/lane_planner/lane_planner/waypoint_model.py b/lane_planner/lane_planner/waypoint_model.py
+index 8e75507..5d07a23 100644
+--- a/lane_planner/lane_planner/waypoint_model.py
++++ b/lane_planner/lane_planner/waypoint_model.py
+@@ -7,8 +7,10 @@ Jetson에서는 ONNX Runtime(GPU) 또는 TensorRT 엔진으로 바꿔 끼울 수
+ - input_width / input_height: 학습 시 입력 크기
+ - 색 순서(RGB/BGR), 정규화 mean/std, 0~1 스케일 여부
+ - 출력 좌표계: wp_x 전방(+), wp_y 좌측(+) 인지 -> 아니면 y_sign = -1.0
++- 출력 개수: (x, y) 쌍이 몇 개인지. 수업 실차 라벨은 0.5~2.0m 7점 -> 출력 14개
++- 출력 원점: 수업 라벨은 카메라 바로 아래 지면 -> 노드 파라미터 model_origin_offset_x 로 보정
+ """
+-from typing import Optional, Sequence, Tuple
++from typing import List, Optional, Sequence, Tuple
+ 
+ import cv2
+ import numpy as np
+@@ -37,7 +39,15 @@ class OnnxWaypointModel:
+         x = (x - self.mean) / self.std
+         return x[None]
+ 
+-    def predict(self, bev_bgr: np.ndarray) -> Tuple[float, float]:
++    def predict(self, bev_bgr: np.ndarray) -> List[Tuple[float, float]]:
++        """모델 출력 전체를 (x, y) 쌍 목록으로 반환한다 (1점이면 길이 1, 7점이면 길이 7)."""
+         out = self.sess.run(None, {self.input_name: self.preprocess(bev_bgr)})[0]
+-        out = np.asarray(out).reshape(-1)
+-        return float(out[0]), self.y_sign * float(out[1])
++        return decode_waypoints(out, self.y_sign)
++
++
++def decode_waypoints(out, y_sign: float = 1.0) -> List[Tuple[float, float]]:
++    flat = np.asarray(out, dtype=np.float64).reshape(-1)
++    if flat.size < 2 or flat.size % 2:
++        raise ValueError(f'모델 출력 길이 {flat.size}: (x, y) 쌍이어야 합니다')
++    xy = flat.reshape(-1, 2)
++    return [(float(x), y_sign * float(y)) for x, y in xy]
+diff --git a/lane_planner/test/test_lane_core.py b/lane_planner/test/test_lane_core.py
+index 904f15e..1e1dc6c 100644
+--- a/lane_planner/test/test_lane_core.py
++++ b/lane_planner/test/test_lane_core.py
+@@ -64,5 +64,54 @@ def test_homography_roundtrip():
+ 
+ 
+ def test_waypoint_plan():
+-    assert lane_core.waypoint_plan((0.9, 0.2), 0.8) == ([(0.9, 0.2)], 0.8)
++    assert lane_core.waypoint_plan([(0.9, 0.2)], 0.8) == ([(0.9, 0.2)], 0.8)
+     assert lane_core.waypoint_plan(None, 0.8) == ([], 0.0)
++
++
++def test_class_defaults():
++    p = LaneParams()
++    assert p.hsv_low == (18, 50, 120) and p.hsv_high == (36, 255, 255)
++    assert p.lane_width_m == 0.80
++
++
++def test_bayer_rggb_keeps_yellow():
++    """bayer_rggb8 -> BGR 변환 후 노란색이 노란색(H 약 30)으로 남아야 한다 (하늘색이면 R/B 뒤바뀜)."""
++    bgr = np.zeros((40, 40, 3), np.uint8)
++    bgr[:] = (0, 220, 230)  # 노랑
++    # RGGB 모자이크: (짝,짝)=R (짝,홀)=G (홀,짝)=G (홀,홀)=B
++    raw = np.zeros((40, 40), np.uint8)
++    raw[0::2, 0::2] = bgr[0::2, 0::2, 2]
++    raw[0::2, 1::2] = bgr[0::2, 1::2, 1]
++    raw[1::2, 0::2] = bgr[1::2, 0::2, 1]
++    raw[1::2, 1::2] = bgr[1::2, 1::2, 0]
++    out = lane_core.bayer_to_bgr(raw, 'bayer_rggb8')
++    h = cv2.cvtColor(out[10:30, 10:30], cv2.COLOR_BGR2HSV)[..., 0].mean()
++    assert 18 <= h <= 36
++    mask = lane_core.lane_mask(out[10:30, 10:30], LaneParams())
++    assert (mask > 0).mean() > 0.9
++
++
++def test_undistort_disabled_by_default():
++    assert lane_core.undistort_maps(LaneParams(), 64, 48) is None
++    p = LaneParams(camera_matrix=[50.0, 0, 32, 0, 50.0, 24, 0, 0, 1], dist_coeffs=[-0.33, 0, 0, 0, 0])
++    m = lane_core.undistort_maps(p, 64, 48)
++    assert m is not None and m[0].shape[:2] == (48, 64)
++
++
++def test_seven_waypoints_with_origin_offset():
++    from lane_planner.waypoint_model import decode_waypoints
++    raw = []
++    for d in (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0):
++        raw += [d, 0.05]
++    wps = decode_waypoints(np.array(raw)[None], y_sign=1.0)
++    assert len(wps) == 7
++    pts, conf = lane_core.waypoint_plan(wps, 0.9, origin_offset_x=0.2)
++    assert len(pts) == 7 and conf == 0.9
++    assert abs(pts[0][0] - 0.7) < 1e-9 and abs(pts[-1][0] - 2.2) < 1e-9
++
++
++def test_decode_rejects_odd_length():
++    from lane_planner.waypoint_model import decode_waypoints
++    import pytest
++    with pytest.raises(ValueError):
++        decode_waypoints(np.array([1.0, 2.0, 3.0]))
+diff --git a/race_bringup/config/race_params.yaml b/race_bringup/config/race_params.yaml
+index 41d996d..c8ec1b2 100644
+--- a/race_bringup/config/race_params.yaml
++++ b/race_bringup/config/race_params.yaml
+@@ -30,7 +30,7 @@ gap_planner:
+ lane_planner:
+   ros__parameters:
+     backend: classic             # classic | onnx
+-    image_topic: /camera/image_raw   # 확인필요: 카메라 드라이버 토픽
++    image_topic: /flir_camera/image_raw   # 수업 기준 (FLIR Blackfly S, spinnaker 드라이버)
+     input_is_bev: false          # 시뮬처럼 BEV 이미지가 바로 들어오면 true
+     speed_limit: 1.5
+     publish_debug_image: false
+@@ -39,18 +39,22 @@ lane_planner:
+     m_per_px: 0.005              # 확인필요
+     origin_u: 200.0              # 확인필요
+     origin_v: 440.0              # 확인필요
+-    hsv_low: [15, 80, 80]        # 확인필요: 실제 차선 테이프 색
+-    hsv_high: [40, 255, 255]     # 확인필요
++    hsv_low: [18, 50, 120]       # 수업 기준값 (노란 테이프). 조명에 따라 조정
++    hsv_high: [36, 255, 255]     # 수업 기준값
+     n_windows: 10
+     window_margin: 40
+     min_pixels: 30
+-    lane_width_m: 0.6            # 확인필요: 실제 차선 폭
++    lane_width_m: 0.80           # 수업 예시 실측값. 확인필요: 우리 트랙 차선 폭 실측
+     path_step_m: 0.1
+     path_max_m: 1.5
+     path_min_m: 0.2
+     single_side_penalty: 0.7
+     # 확인필요: calibrate_homography 출력값으로 교체 (전부 0이면 차선 계획을 내지 않음)
+     homography: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
++    # 렌즈 왜곡 보정: 수업 ost.yaml의 camera_matrix(9개), distortion_coefficients(5개)를 그대로 옮김
++    # 확인필요: 우리 카메라의 ost.yaml 값. 전부 0이면 보정 안 함
++    camera_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
++    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+     # --- backend: onnx 일 때만 사용 (수업 학습 코드와 일치시킬 것) ---
+     model_path: ""               # 확인필요
+     model_input_width: 224       # 확인필요
+@@ -58,7 +62,9 @@ lane_planner:
+     model_mean: [0.485, 0.456, 0.406]   # 확인필요
+     model_std: [0.229, 0.224, 0.225]    # 확인필요
+     model_rgb: true              # 확인필요
+-    model_y_sign: 1.0            # 확인필요: 모델 wp_y가 우측(+)이면 -1.0
++    model_y_sign: 1.0            # 수업 라벨은 Y 좌측(+) -> 1.0
++    # 수업 라벨 원점(카메라 바로 아래 지면)이 뒷바퀴 축보다 앞에 있는 거리 [m]
++    model_origin_offset_x: 0.0   # 확인필요: 뒷바퀴 축 중심 ~ 카메라 렌즈 바로 아래 바닥점 거리 실측
+ 
+ mode_manager:
+   ros__parameters:
+-- 
+2.43.0
+
